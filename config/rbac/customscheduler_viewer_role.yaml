@@ -1,0 +1,23 @@
+# permissions for end users to view customschedulers.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: custom-scheduler-controller
+    app.kubernetes.io/managed-by: kustomize
+  name: customscheduler-viewer-role
+rules:
+- apiGroups:
+  - serving.local.dev
+  resources:
+  - customschedulers
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - serving.local.dev
+  resources:
+  - customschedulers/status
+  verbs:
+  - get

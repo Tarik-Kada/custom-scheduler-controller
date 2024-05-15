@@ -1,0 +1,9 @@
+apiVersion: serving.local.dev/v1alpha1
+kind: CustomScheduler
+metadata:
+  labels:
+    app.kubernetes.io/name: custom-scheduler-controller
+    app.kubernetes.io/managed-by: kustomize
+  name: customscheduler-sample
+spec:
+  # TODO(user): Add fields here
