@@ -19,6 +19,11 @@ package controller
 import (
 	"context"
     "time"
+    "encoding/json"
+    "fmt"
+    "net/http"
+    "io/ioutil"
+    "bytes"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -34,6 +39,10 @@ import (
 type CustomSchedulerReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+}
+
+type SchedulerResponse struct {
+    Node string `json:"node"`
 }
 
 //+kubebuilder:rbac:groups=serving.local.dev,resources=customschedulers,verbs=get;list;watch;create;update;patch;delete
@@ -60,10 +69,16 @@ func (r *CustomSchedulerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
     logger.Info("Found pods", "count", len(pods.Items))
 
-    // Example: Bind each Pod to a hard-coded node "knative-worker"
+    // Bind each unassigned Pod to a node specified by the external scheduler
     for _, pod := range pods.Items {
         if pod.Spec.NodeName == "" { // Check if the pod is not assigned to any node
-            logger.Info("Binding pod", "podName", pod.Name)
+            nodeName, err := r.getNodeFromScheduler(pod)
+            if err != nil {
+                logger.Error(err, "Failed to get node from scheduler")
+                return ctrl.Result{}, err
+            }
+
+            logger.Info("Binding pod", "podName", pod.Name, "nodeName", nodeName)
             binding := &corev1.Binding{
                 ObjectMeta: metav1.ObjectMeta{
                     Name:      pod.Name,
@@ -71,7 +86,7 @@ func (r *CustomSchedulerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
                 },
                 Target: corev1.ObjectReference{
                     Kind: "Node",
-                    Name: "knative-worker",
+                    Name: nodeName,
                 },
             }
             if err := r.Client.Create(ctx, binding); err != nil {
@@ -82,6 +97,39 @@ func (r *CustomSchedulerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
     }
 
     return ctrl.Result{RequeueAfter: time.Second * 5}, nil
+}
+
+func (r *CustomSchedulerReconciler) getNodeFromScheduler(pod corev1.Pod) (string, error) {
+    client := &http.Client{}
+    req, err := http.NewRequest("POST", "http://scheduler-simple-flask.default.svc.cluster.local/schedule", nil)
+    if err != nil {
+        return "", err
+    }
+
+    req.Header.Set("Content-Type", "application/json")
+    podData, err := json.Marshal(pod)
+    if err != nil {
+        return "", err
+    }
+
+    req.Body = ioutil.NopCloser(bytes.NewReader(podData))
+
+    resp, err := client.Do(req)
+    if err != nil {
+        return "", err
+    }
+    defer resp.Body.Close()
+
+    if resp.StatusCode != http.StatusOK {
+        return "", fmt.Errorf("unexpected status code: %v", resp.StatusCode)
+    }
+
+    var schedulerResponse SchedulerResponse
+    if err := json.NewDecoder(resp.Body).Decode(&schedulerResponse); err != nil {
+        return "", err
+    }
+
+    return schedulerResponse.Node, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
