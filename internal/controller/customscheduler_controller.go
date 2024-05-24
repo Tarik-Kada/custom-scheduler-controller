@@ -26,11 +26,11 @@ import (
     "net/url"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/log"
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	ctrl "sigs.k8s.io/controller-runtime"
-	"k8s.io/apimachinery/pkg/runtime"
+    "sigs.k8s.io/controller-runtime/pkg/log"
+    corev1 "k8s.io/api/core/v1"
+    metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+    ctrl "sigs.k8s.io/controller-runtime"
+    "k8s.io/apimachinery/pkg/runtime"
     "k8s.io/apimachinery/pkg/types"
 
 	servingv1alpha1 "github.com/Tarik-Kada/custom-scheduler-controller/api/v1alpha1"
@@ -52,6 +52,7 @@ type CustomMetric struct {
 }
 
 type SchedulerRequest struct {
+    Parameters      map[string]interface{} `json:"parameters"`
     Pod             FilteredPod       `json:"pod"`
     ClusterInfo     ClusterInfo      `json:"clusterInfo"`
     Metrics         map[string]interface{} `json:"metrics"`
@@ -134,6 +135,12 @@ func (r *CustomSchedulerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
         return ctrl.Result{}, err
     }
 
+    var parameters map[string]interface{}
+    if err := json.Unmarshal([]byte(configMap.Data["parameters"]), &parameters); err != nil {
+        logger.Error(err, "Failed to unmarshal parameters")
+        return ctrl.Result{}, err
+    }
+
     prometheusURL := "http://prometheus-kube-prometheus-prometheus.default.svc.cluster.local:9090"
     metrics := make(map[string]interface{})
     prometheusError := ""
@@ -166,6 +173,7 @@ func (r *CustomSchedulerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
             }
 
             request := SchedulerRequest{
+                Parameters:      parameters,
                 Pod:             filteredPod,
                 ClusterInfo:     clusterInfo,
                 Metrics:         metrics,
@@ -210,8 +218,6 @@ func isPrometheusAvailable(prometheusURL string) bool {
 func (r *CustomSchedulerReconciler) getCustomMetrics(prometheusURL string, queries []CustomMetric) (map[string]interface{}, error) {
     metrics := make(map[string]interface{})
 
-
-
     for _, metric := range queries {
         resp, err := http.Get(prometheusURL + "/api/v1/query?query=" + url.QueryEscape(metric.Query))
         if err != nil {
@@ -236,6 +242,11 @@ func (r *CustomSchedulerReconciler) getNodeInfo(ctx context.Context) ([]NodeInfo
 
     var nodeInfos []NodeInfo
     for _, node := range nodes.Items {
+        // Filter out nodes that have the control-plane role
+        if _, ok := node.Labels["node-role.kubernetes.io/control-plane"]; ok {
+            continue
+        }
+
         nodeInfo := NodeInfo{
             NodeName:          node.Name,
             Status:            getNodeStatus(&node),
