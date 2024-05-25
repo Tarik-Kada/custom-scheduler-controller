@@ -17,29 +17,34 @@ limitations under the License.
 package controller
 
 import (
-	"context"
-    "time"
+    "context"
     "encoding/json"
     "fmt"
     "net/http"
     "bytes"
     "net/url"
 
-	"sigs.k8s.io/controller-runtime/pkg/client"
+    "sigs.k8s.io/controller-runtime/pkg/client"
     "sigs.k8s.io/controller-runtime/pkg/log"
+    "sigs.k8s.io/controller-runtime/pkg/handler"
+    // "sigs.k8s.io/controller-runtime/pkg/source"
+    "sigs.k8s.io/controller-runtime/pkg/event"
+    "sigs.k8s.io/controller-runtime/pkg/predicate"
+    "sigs.k8s.io/controller-runtime/pkg/reconcile"
+    "sigs.k8s.io/controller-runtime/pkg/builder"
     corev1 "k8s.io/api/core/v1"
     metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
     ctrl "sigs.k8s.io/controller-runtime"
     "k8s.io/apimachinery/pkg/runtime"
     "k8s.io/apimachinery/pkg/types"
 
-	servingv1alpha1 "github.com/Tarik-Kada/custom-scheduler-controller/api/v1alpha1"
+    servingv1alpha1 "github.com/Tarik-Kada/custom-scheduler-controller/api/v1alpha1"
 )
 
 // CustomSchedulerReconciler reconciles a CustomScheduler object
 type CustomSchedulerReconciler struct {
-	client.Client
-	Scheme *runtime.Scheme
+    client.Client
+    Scheme *runtime.Scheme
 }
 
 type SchedulerResponse struct {
@@ -96,15 +101,17 @@ type ContainerInfo struct {
 
 
 func (r *CustomSchedulerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	logger := log.FromContext(ctx)
+    logger := log.FromContext(ctx)
+    logger.Info("Reconcile function called", "name", req.Name, "namespace", req.Namespace)
 
-	// Fetch the CustomScheduler instance
+    // Fetch the CustomScheduler instance
     var customScheduler servingv1alpha1.CustomScheduler
     if err := r.Get(ctx, req.NamespacedName, &customScheduler); err != nil {
+        logger.Error(err, "Failed to get CustomScheduler")
         return ctrl.Result{}, client.IgnoreNotFound(err)
     }
 
-	logger.Info("Reconciling CustomScheduler", "schedulerName", customScheduler.Spec.SchedulerName)
+    logger.Info("Reconciling CustomScheduler", "schedulerName", customScheduler.Spec.SchedulerName)
 
     // Fetch all Pods with the specified schedulerName
     var pods corev1.PodList
@@ -204,7 +211,7 @@ func (r *CustomSchedulerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
         }
     }
 
-    return ctrl.Result{RequeueAfter: time.Second * 5}, nil
+    return ctrl.Result{}, nil
 }
 
 func isPrometheusAvailable(prometheusURL string) bool {
@@ -350,14 +357,60 @@ func (r *CustomSchedulerReconciler) getNodeFromScheduler(request SchedulerReques
 }
 
 // SetupWithManager sets up the controller with the Manager.
+// func (r *CustomSchedulerReconciler) SetupWithManager(mgr ctrl.Manager) error {
+//     if err := mgr.GetFieldIndexer().IndexField(context.Background(), &corev1.Pod{}, "spec.schedulerName", func(rawObj client.Object) []string {
+//         pod := rawObj.(*corev1.Pod)
+//         return []string{pod.Spec.SchedulerName}
+//     }); err != nil {
+//         return err
+//     }
+
+//     return ctrl.NewControllerManagedBy(mgr).
+//         For(&servingv1alpha1.CustomScheduler{}).
+//         Watches(
+//             &corev1.Pod{},
+//             &handler.EnqueueRequestForObject{},
+//         ).
+//         Complete(r)
+// }
+
+func podToCustomSchedulerMapper(a handler.MapFunc) []reconcile.Request {
+    // Get the scheduler name from the Pod
+    schedulerName := a.Meta.GetAnnotations()["scheduler.alpha.kubernetes.io/name"]
+
+    // Return a reconcile request for the CustomScheduler with the same name
+    return []reconcile.Request{
+        {NamespacedName: types.NamespacedName{Name: schedulerName}},
+    }
+}
+
 func (r *CustomSchedulerReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	if err := mgr.GetFieldIndexer().IndexField(context.Background(), &corev1.Pod{}, "spec.schedulerName", func(rawObj client.Object) []string {
+    if err := mgr.GetFieldIndexer().IndexField(context.Background(), &corev1.Pod{}, "spec.schedulerName", func(rawObj client.Object) []string {
         pod := rawObj.(*corev1.Pod)
         return []string{pod.Spec.SchedulerName}
     }); err != nil {
         return err
     }
+
+    schedulerNamePredicate := predicate.Funcs{
+        UpdateFunc: func(e event.UpdateEvent) bool {
+            return e.ObjectNew.(*corev1.Pod).Spec.SchedulerName == "custom-scheduler"
+        },
+        CreateFunc: func(e event.CreateEvent) bool {
+            return e.Object.(*corev1.Pod).Spec.SchedulerName == "custom-scheduler"
+        },
+    }
+
     return ctrl.NewControllerManagedBy(mgr).
         For(&servingv1alpha1.CustomScheduler{}).
+        Watches(
+            &corev1.Pod{},
+            &handler.EnqueueRequestsFromMapFunc{
+                ToRequests: handler.ToRequestsFunc(func(a client.Object) []reconcile.Request {
+                    return podToCustomSchedulerMapper(a)
+                }),
+            },
+            builder.WithPredicates(schedulerNamePredicate),
+        ).
         Complete(r)
 }
