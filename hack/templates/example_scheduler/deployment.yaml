@@ -1,0 +1,53 @@
+# This is the deployment file for the custom scheduler
+# It is important to keep the fields marked with "EQUAL" equal to each other.
+# The cluster uses the values of these fields to identify the custom scheduler
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: custom-scheduler # EQUAL
+  namespace: default
+  labels:
+    app: custom-scheduler # EQUAL
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: custom-scheduler # EQUAL
+  template:
+    metadata:
+      labels:
+        app: custom-scheduler # EQUAL
+    spec:
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
+      tolerations:
+      - key: "node-role.kubernetes.io/control-plane"
+        operator: "Exists"
+        effect: "NoSchedule"
+      containers:
+      # This is the name of the container, change it to your liking
+      - name: scheduler-simple-flask
+        # This is the image that the custom scheduler will run
+        # Replace YOUR_DOCKERHUB_USERNAME with your DockerHub username
+        # Replace YOUR_SCHEDULER_IMAGE with the name of the image you pushed to DockerHub
+        image: YOUR_DOCKERHUB_USERNAME/YOUR_SCHEDULER_IMAGE:latest
+        # This is the port that the custom scheduler will listen on
+        ports:
+        - containerPort: 5000
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: custom-scheduler # EQUAL
+spec:
+  selector:
+    app: custom-scheduler # EQUAL
+  ports:
+  - protocol: TCP
+    # Port is the port that is used for internal communication within the cluster
+    # Keeping it as 80 is good practice
+    port: 80
+    # Target port is the port that the custom scheduler is listening on
+    targetPort: 5000
