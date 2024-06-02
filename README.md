@@ -16,4 +16,9 @@ The logic is found in the [customscheduler_controller.go](https://github.com/Tar
 - Passing of custom metrics, parameters, and cluster info to the external scheduling algorithm
 - Retrieving the scheduling decision and binding the pod accordingly.
 
+## Example external scheduler implementation
 The repository also contains [examples](https://github.com/Tarik-Kada/custom-scheduler-controller/blob/main/hack/templates) for the deployment of a custom scheduling algorithm that works with the controller logic to produce scheduling decisions.
+
+## Quick Start
+
+To quickly get started, deploy [the extended Knative Serving implementation](https://github.com/Tarik-Kada/knative-serving) using the quickstart scripts provided in its repository. Then deploy the custom scheduler by executing [the deploy.sh script](https://github.com/Tarik-Kada/custom-scheduler-controller/blob/main/hack/deploy.sh).
