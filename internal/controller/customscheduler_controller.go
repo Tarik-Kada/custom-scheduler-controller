@@ -33,6 +33,7 @@ import (
     "sigs.k8s.io/controller-runtime/pkg/reconcile"
     "sigs.k8s.io/controller-runtime/pkg/builder"
     corev1 "k8s.io/api/core/v1"
+    appsv1 "k8s.io/api/apps/v1"
     metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
     ctrl "sigs.k8s.io/controller-runtime"
     "k8s.io/apimachinery/pkg/runtime"
@@ -98,12 +99,13 @@ type ContainerInfo struct {
 //+kubebuilder:rbac:groups="",resources=pods;pods/binding;bindings,verbs=get;list;watch;create;update;patch
 //+kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 //+kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
+//+kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
+//+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch
 
 
 func (r *CustomSchedulerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
     logger := log.FromContext(ctx)
     logger.Info("Reconcile function called", "name", req.Name, "namespace", req.Namespace)
-    
 
     logger.Info("Trying to get pod: ", "name", req.Name, "namespace", req.Namespace)
     // Get the pod that triggered the reconcile
@@ -164,6 +166,51 @@ func (r *CustomSchedulerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
         return ctrl.Result{}, err
     }
 
+    schedulerName := configMap.Data["schedulerName"]
+    schedulerNamespace := configMap.Data["schedulerNamespace"]
+
+    if schedulerName == "" || schedulerNamespace == "" {
+        logger.Error(nil, "Scheduler name or namespace is not defined in the scheduler-config ConfigMap")
+        return ctrl.Result{}, fmt.Errorf("scheduler name or namespace is not defined")
+    }
+    logger.Info("Scheduler name and namespace", "schedulerName", schedulerName, "schedulerNamespace", schedulerNamespace)
+
+    // Read the Deployment and Service for the custom scheduler
+    var schedulerService corev1.Service
+    if err := r.Get(ctx, types.NamespacedName{Name: schedulerName, Namespace: schedulerNamespace}, &schedulerService); err != nil {
+        logger.Error(err, "Failed to get Scheduler Service")
+        return ctrl.Result{}, err
+    }
+
+    var schedulerDeployment appsv1.Deployment
+    if err := r.Get(ctx, types.NamespacedName{Name: schedulerName, Namespace: schedulerNamespace}, &schedulerDeployment); err != nil {
+        logger.Error(err, "Failed to get Scheduler Deployment")
+        return ctrl.Result{}, err
+    }
+
+    // Construct the URL for the scheduler
+    schedulerURL := fmt.Sprintf("http://%s.%s.svc.cluster.local:%d",
+                                schedulerService.Name,
+                                schedulerService.Namespace,
+                                schedulerService.Spec.Ports[0].Port)
+
+    // Fetch all Pods with the specified schedulerName
+    var pods corev1.PodList
+    if err := r.List(ctx, &pods, client.MatchingFields{"spec.schedulerName": customScheduler.Spec.SchedulerName}); err != nil {
+        return ctrl.Result{}, err
+    }
+
+    if len(pods.Items) != 0 {
+        logger.Info("Found pods", "count", len(pods.Items))
+    }
+
+    // Get cluster information
+    clusterInfo, err := r.getClusterInfo(ctx)
+    if err != nil {
+        logger.Error(err, "Failed to get cluster information")
+        return ctrl.Result{}, err
+    }
+
     prometheusURL := "http://prometheus-kube-prometheus-prometheus.default.svc.cluster.local:9090"
     metrics := make(map[string]interface{})
     prometheusError := ""
@@ -203,7 +250,7 @@ func (r *CustomSchedulerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
             PrometheusError: prometheusError,
         }
 
-        nodeName, err := r.getNodeFromScheduler(request)
+        nodeName, err := r.getNodeFromScheduler(request, schedulerURL)
         if err != nil {
             logger.Error(err, "Failed to get node from scheduler")
             return ctrl.Result{}, err
@@ -340,7 +387,7 @@ func (r *CustomSchedulerReconciler) getClusterInfo(ctx context.Context) (Cluster
     return ClusterInfo{Nodes: nodeInfos}, nil
 }
 
-func (r *CustomSchedulerReconciler) getNodeFromScheduler(request SchedulerRequest) (string, error) {
+func (r *CustomSchedulerReconciler) getNodeFromScheduler(request SchedulerRequest, schedulerURL string) (string, error) {
     client := &http.Client{}
     reqBody, err := json.Marshal(request)
 
@@ -348,7 +395,7 @@ func (r *CustomSchedulerReconciler) getNodeFromScheduler(request SchedulerReques
         return "", err
     }
 
-    req, err := http.NewRequest("POST", "http://scheduler-simple-flask.default.svc.cluster.local/schedule", bytes.NewBuffer(reqBody))
+    req, err := http.NewRequest("POST", schedulerURL, bytes.NewBuffer(reqBody))
     if err != nil {
         return "", err
     }

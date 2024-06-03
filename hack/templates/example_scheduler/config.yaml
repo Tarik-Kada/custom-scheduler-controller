@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: scheduler-config # Has to be scheduler-config
+  namespace: default # Has to be default
+data:
+  schedulerName: "custom-scheduler"
+  schedulerNamespace: "default"
+  # These are the custom metrics that the scheduler can use to make scheduling decisions
+  # The metrics are defined as a list of dictionaries, where each dictionary has a metricName and a query
+  # The query is a Prometheus query that will be used to fetch the metric values
+  customMetrics: |
+    [
+      {"metricName": "cpuUsage", "query": "sum(rate(container_cpu_usage_seconds_total{image!=\"\"}[5m])) by (node)"},
+      {"metricName": "memoryUsage", "query": "sum(container_memory_usage_bytes) by (node)"}
+    ]
+  # These are the parameters that the scheduler can use to make scheduling decisions
+  # The parameters are defined as a dictionary, where each key is a parameter name and the value is the parameter value
+  parameters: |
+    {"worker": 3, "timeout": 30, "maxRetries": 20}
