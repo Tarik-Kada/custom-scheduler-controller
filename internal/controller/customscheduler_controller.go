@@ -18,7 +18,6 @@ package controller
 
 import (
     "context"
-    "time"
     "encoding/json"
     "fmt"
     "net/http"
@@ -27,6 +26,12 @@ import (
 
     "sigs.k8s.io/controller-runtime/pkg/client"
     "sigs.k8s.io/controller-runtime/pkg/log"
+    "sigs.k8s.io/controller-runtime/pkg/handler"
+    // "sigs.k8s.io/controller-runtime/pkg/source"
+    // "sigs.k8s.io/controller-runtime/pkg/event"
+    "sigs.k8s.io/controller-runtime/pkg/predicate"
+    "sigs.k8s.io/controller-runtime/pkg/reconcile"
+    "sigs.k8s.io/controller-runtime/pkg/builder"
     corev1 "k8s.io/api/core/v1"
     appsv1 "k8s.io/api/apps/v1"
     metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -102,16 +107,47 @@ func (r *CustomSchedulerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
     logger := log.FromContext(ctx)
     logger.Info("Reconcile function called", "name", req.Name, "namespace", req.Namespace)
 
-    // Fetch the CustomScheduler instance
-    var customScheduler servingv1alpha1.CustomScheduler
-    if err := r.Get(ctx, req.NamespacedName, &customScheduler); err != nil {
-        logger.Error(err, "Failed to get CustomScheduler")
+    logger.Info("Trying to get pod: ", "name", req.Name, "namespace", req.Namespace)
+    // Get the pod that triggered the reconcile
+    var pod corev1.Pod
+    if err := r.Get(ctx, req.NamespacedName, &pod); err != nil {
+        logger.Info(err, "Failed to get Pod, Probably not workload pod")
         return ctrl.Result{}, client.IgnoreNotFound(err)
     }
 
-    logger.Info("Reconciling CustomScheduler", "schedulerName", customScheduler.Spec.SchedulerName)
-    
-    // Load configuration from ConfigMap
+    // List all CustomScheduler instances
+    var customSchedulers servingv1alpha1.CustomSchedulerList
+    if err := r.List(ctx, &customSchedulers, &client.ListOptions{Namespace: "default"}); err != nil {
+        logger.Error(err, "Failed to list CustomSchedulers")
+        return ctrl.Result{}, err
+    }
+
+    if len(customSchedulers.Items) == 0 {
+        logger.Error(fmt.Errorf("no CustomScheduler found"), "No CustomScheduler instances found")
+        return ctrl.Result{}, nil
+    }
+
+    // Assuming there's only one CustomScheduler instance
+    customScheduler := customSchedulers.Items[0]
+    logger.Info("Reconciling CustomScheduler", "Name", customScheduler.Name, "schedulerName", customScheduler.Spec.SchedulerName)
+
+    // // Fetch all Pods with the specified schedulerName
+    // var pods corev1.PodList
+    // if err := r.List(ctx, &pods, client.MatchingFields{"spec.schedulerName": customScheduler.Spec.SchedulerName}); err != nil {
+    //     return ctrl.Result{}, err
+    // }
+    // if len(pods.Items) != 0 {
+    //     logger.Info("Found pods", "count", len(pods.Items))
+    // }
+
+    // Get cluster information
+    clusterInfo, err := r.getClusterInfo(ctx)
+    if err != nil {
+        logger.Error(err, "Failed to get cluster information")
+        return ctrl.Result{}, err
+    }
+
+    // Load custom metrics from ConfigMap
     var configMap corev1.ConfigMap
     if err := r.Get(ctx, types.NamespacedName{Name: "scheduler-config", Namespace: "default"}, &configMap); err != nil {
         logger.Error(err, "Failed to get scheduler-config ConfigMap")
@@ -192,53 +228,53 @@ func (r *CustomSchedulerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
     }
 
     // Bind each unassigned Pod to a node specified by the external scheduler
-    for _, pod := range pods.Items {
-        if pod.Spec.NodeName == "" { // Check if the pod is not assigned to any node
-            filteredPod := FilteredPod{
-                Name:         pod.Name,
-                Namespace:    pod.Namespace,
-                Labels:       pod.Labels,
-                ServingService: pod.Labels["serving.knative.dev/service"],
-                ServingRevision: pod.Labels["serving.knative.dev/revision"],
-                Container: ContainerInfo{
-                    Name:  pod.Spec.Containers[0].Name, // Assuming the first container is the user-container
-                    Image: pod.Spec.Containers[0].Image, // Assuming the first container is the user-container
-                },
-            }
+    // for _, pod := range pods.Items {
+    if pod.Spec.NodeName == "" { // Check if the pod is not assigned to any node
+        filteredPod := FilteredPod{
+            Name:         pod.Name,
+            Namespace:    pod.Namespace,
+            Labels:       pod.Labels,
+            ServingService: pod.Labels["serving.knative.dev/service"],
+            ServingRevision: pod.Labels["serving.knative.dev/revision"],
+            Container: ContainerInfo{
+                Name:  pod.Spec.Containers[0].Name, // Assuming the first container is the user-container
+                Image: pod.Spec.Containers[0].Image, // Assuming the first container is the user-container
+            },
+        }
 
-            request := SchedulerRequest{
-                Parameters:      parameters,
-                Pod:             filteredPod,
-                ClusterInfo:     clusterInfo,
-                Metrics:         metrics,
-                PrometheusError: prometheusError,
-            }
+        request := SchedulerRequest{
+            Parameters:      parameters,
+            Pod:             filteredPod,
+            ClusterInfo:     clusterInfo,
+            Metrics:         metrics,
+            PrometheusError: prometheusError,
+        }
 
-            nodeName, err := r.getNodeFromScheduler(request, schedulerURL)
-            if err != nil {
-                logger.Error(err, "Failed to get node from scheduler")
-                return ctrl.Result{}, err
-            }
+        nodeName, err := r.getNodeFromScheduler(request, schedulerURL)
+        if err != nil {
+            logger.Error(err, "Failed to get node from scheduler")
+            return ctrl.Result{}, err
+        }
 
-            logger.Info("Binding pod", "podName", pod.Name, "nodeName", nodeName)
-            binding := &corev1.Binding{
-                ObjectMeta: metav1.ObjectMeta{
-                    Name:      pod.Name,
-                    Namespace: pod.Namespace,
-                },
-                Target: corev1.ObjectReference{
-                    Kind: "Node",
-                    Name: nodeName,
-                },
-            }
-            if err := r.Client.Create(ctx, binding); err != nil {
-                logger.Error(err, "Failed to bind pod", "podName", pod.Name)
-                return ctrl.Result{}, err
-            }
+        logger.Info("Binding pod", "podName", pod.Name, "nodeName", nodeName)
+        binding := &corev1.Binding{
+            ObjectMeta: metav1.ObjectMeta{
+                Name:      pod.Name,
+                Namespace: pod.Namespace,
+            },
+            Target: corev1.ObjectReference{
+                Kind: "Node",
+                Name: nodeName,
+            },
+        }
+        if err := r.Client.Create(ctx, binding); err != nil {
+            logger.Error(err, "Failed to bind pod", "podName", pod.Name)
+            return ctrl.Result{}, err
         }
     }
+    // }
 
-    return ctrl.Result{RequeueAfter: time.Second * 5}, nil
+    return ctrl.Result{}, nil
 }
 
 func isPrometheusAvailable(prometheusURL string) bool {
@@ -354,6 +390,7 @@ func (r *CustomSchedulerReconciler) getClusterInfo(ctx context.Context) (Cluster
 func (r *CustomSchedulerReconciler) getNodeFromScheduler(request SchedulerRequest, schedulerURL string) (string, error) {
     client := &http.Client{}
     reqBody, err := json.Marshal(request)
+
     if err != nil {
         return "", err
     }
@@ -383,7 +420,24 @@ func (r *CustomSchedulerReconciler) getNodeFromScheduler(request SchedulerReques
     return schedulerResponse.Node, nil
 }
 
-// SetupWithManager sets up the controller with the Manager.
+// // SetupWithManager sets up the controller with the Manager.
+// func (r *CustomSchedulerReconciler) SetupWithManager(mgr ctrl.Manager) error {
+//     if err := mgr.GetFieldIndexer().IndexField(context.Background(), &corev1.Pod{}, "spec.schedulerName", func(rawObj client.Object) []string {
+//         pod := rawObj.(*corev1.Pod)
+//         return []string{pod.Spec.SchedulerName}
+//     }); err != nil {
+//         return err
+//     }
+
+//     return ctrl.NewControllerManagedBy(mgr).
+//         For(&servingv1alpha1.CustomScheduler{}).
+//         Watches(
+//             &corev1.Pod{},
+//             &handler.EnqueueRequestForObject{},
+//         ).
+//         Complete(r)
+// }
+
 func (r *CustomSchedulerReconciler) SetupWithManager(mgr ctrl.Manager) error {
     if err := mgr.GetFieldIndexer().IndexField(context.Background(), &corev1.Pod{}, "spec.schedulerName", func(rawObj client.Object) []string {
         pod := rawObj.(*corev1.Pod)
@@ -391,7 +445,26 @@ func (r *CustomSchedulerReconciler) SetupWithManager(mgr ctrl.Manager) error {
     }); err != nil {
         return err
     }
+
     return ctrl.NewControllerManagedBy(mgr).
         For(&servingv1alpha1.CustomScheduler{}).
+        Watches(
+            &corev1.Pod{},
+            handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, a client.Object) []reconcile.Request {
+                pod := a.(*corev1.Pod)
+                return []reconcile.Request{
+                    {NamespacedName: types.NamespacedName{
+                        Name:      pod.Name,
+                        Namespace: pod.Namespace,
+                    }},
+                }
+            }),
+            builder.WithPredicates(
+                predicate.NewPredicateFuncs(func(obj client.Object) bool {
+                    pod := obj.(*corev1.Pod)
+                    return pod.Spec.SchedulerName == "custom-scheduler"
+                }),
+            ),
+        ).
         Complete(r)
 }
