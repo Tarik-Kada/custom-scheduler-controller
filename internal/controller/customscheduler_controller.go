@@ -68,22 +68,26 @@ type ClusterInfo struct {
 }
 
 type NodeInfo struct {
-    NodeName          string   `json:"nodeName"`
-    Status            string   `json:"nodeStatus"`
-    CpuCapacity       string   `json:"cpuCapacity"`
-    MemoryCapacity    string   `json:"memoryCapacity"`
-    CpuAllocatable    string   `json:"cpuAllocatable"`
-    MemoryAllocatable string   `json:"memoryAllocatable"`
+    // NodeStatus        corev1.NodeStatus `json:"nodeCompleteStatus"`
+    NodeName          string        `json:"nodeName"`
+    Status            string        `json:"nodeStatus"`
+    CpuCapacity       string        `json:"cpuCapacity"`
+    MemoryCapacity    string        `json:"memoryCapacity"`
+    IoCapacity        string        `json:"ioCapacity"`
+    CpuUsage          string        `json:"cpuUsage"`
+    MemoryUsage       string        `json:"memoryUsage"`
+    IoUsage           string        `json:"ioUsage"`
     RunningPods       []FilteredPod `json:"runningPods"`
 }
 
+
 type FilteredPod struct {
-    Name         string            `json:"name"`
-    Namespace    string            `json:"namespace"`
-    Labels       map[string]string `json:"labels"`
-    ServingService string          `json:"servingService"`
-    ServingRevision string         `json:"servingRevision"`
-    Container    ContainerInfo     `json:"container"`
+    Name             string            `json:"name"`
+    Namespace        string            `json:"namespace"`
+    CpuRequests      string            `json:"cpuRequests"`
+    MemoryRequests   string            `json:"memoryRequests"`
+    IoRequests       string            `json:"ioRequests"`
+    Containers       []ContainerInfo   `json:"containers"`
 }
 
 type ContainerInfo struct {
@@ -211,17 +215,7 @@ func (r *CustomSchedulerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
     // Bind each unassigned Pod to a node specified by the external scheduler
     if pod.Spec.NodeName == "" { // Check if the pod is not assigned to any node
-        filteredPod := FilteredPod{
-            Name:         pod.Name,
-            Namespace:    pod.Namespace,
-            Labels:       pod.Labels,
-            ServingService: pod.Labels["serving.knative.dev/service"],
-            ServingRevision: pod.Labels["serving.knative.dev/revision"],
-            Container: ContainerInfo{
-                Name:  pod.Spec.Containers[0].Name, // Assuming the first container is the user-container
-                Image: pod.Spec.Containers[0].Image, // Assuming the first container is the user-container
-            },
-        }
+        filteredPod := r.createFilteredPod(pod)
 
         request := SchedulerRequest{
             Parameters:      parameters,
@@ -284,26 +278,62 @@ func (r *CustomSchedulerReconciler) getCustomMetrics(prometheusURL string, queri
     return metrics, nil
 }
 
+func (r *CustomSchedulerReconciler) createFilteredPod(pod corev1.Pod) FilteredPod {
+    var totalCpuRequests, totalMemoryRequests, totalIoRequests int64
+    var containers []ContainerInfo
+
+    for _, container := range pod.Spec.Containers {
+        totalCpuRequests += container.Resources.Requests.Cpu().MilliValue()
+        totalMemoryRequests += container.Resources.Requests.Memory().Value()
+        totalIoRequests += container.Resources.Requests.StorageEphemeral().Value()
+
+        containers = append(containers, ContainerInfo{
+            Name:  container.Name,
+            Image: container.Image,
+        })
+    }
+
+    return FilteredPod{
+        Name:            pod.Name,
+        Namespace:       pod.Namespace,
+        CpuRequests:     fmt.Sprintf("%dm", totalCpuRequests),
+        MemoryRequests:  fmt.Sprintf("%dMi", totalMemoryRequests/(1024*1024)),
+        IoRequests:      fmt.Sprintf("%d", totalIoRequests),
+        Containers:      containers,
+    }
+}
+
 func (r *CustomSchedulerReconciler) getNodeInfo(ctx context.Context) ([]NodeInfo, error) {
     var nodes corev1.NodeList
     if err := r.List(ctx, &nodes); err != nil {
         return nil, err
     }
 
+
     var nodeInfos []NodeInfo
     for _, node := range nodes.Items {
-        // Filter out nodes that have the control-plane role
         if _, ok := node.Labels["node-role.kubernetes.io/control-plane"]; ok {
             continue
         }
 
+        cpuCapacity := node.Status.Capacity.Cpu().String()
+        memoryCapacity := node.Status.Capacity.Memory().String()
+        ioCapacity := node.Status.Capacity.StorageEphemeral().String()
+
+        cpuUsage := node.Status.Allocatable.Cpu().String()
+        memoryUsage := node.Status.Allocatable.Memory().String()
+        ioUsage := node.Status.Allocatable.StorageEphemeral().String()
+
         nodeInfo := NodeInfo{
+            // NodeStatus:        node.Status,
             NodeName:          node.Name,
             Status:            getNodeStatus(&node),
-            CpuCapacity:       node.Status.Capacity.Cpu().String(),
-            MemoryCapacity:    node.Status.Capacity.Memory().String(),
-            CpuAllocatable:    node.Status.Allocatable.Cpu().String(),
-            MemoryAllocatable: node.Status.Allocatable.Memory().String(),
+            CpuCapacity:       cpuCapacity,
+            MemoryCapacity:    memoryCapacity,
+            IoCapacity:        ioCapacity,
+            CpuUsage:          cpuUsage,
+            MemoryUsage:       memoryUsage,
+            IoUsage:           ioUsage,
             RunningPods:       []FilteredPod{},
         }
         nodeInfos = append(nodeInfos, nodeInfo)
@@ -331,17 +361,7 @@ func (r *CustomSchedulerReconciler) getPodInfo(ctx context.Context) (map[string]
 
     filteredPodMap := make(map[string][]FilteredPod)
     for _, pod := range pods.Items {
-        filteredPod := FilteredPod{
-            Name:       pod.Name,
-            Namespace:  pod.Namespace,
-            Labels:     pod.Labels,
-            ServingService: pod.Labels["serving.knative.dev/service"],
-            ServingRevision: pod.Labels["serving.knative.dev/revision"],
-            Container: ContainerInfo{
-                Name:  pod.Spec.Containers[0].Name, // Assuming the first container is the user-container
-                Image: pod.Spec.Containers[0].Image, // Assuming the first container is the user-container
-            },
-        }
+        filteredPod := r.createFilteredPod(pod)
         filteredPodMap[pod.Spec.NodeName] = append(filteredPodMap[pod.Spec.NodeName], filteredPod)
     }
     return filteredPodMap, nil
