@@ -18,7 +18,6 @@ package controller
 
 import (
     "context"
-    "time"
     "encoding/json"
     "fmt"
     "net/http"
@@ -27,6 +26,10 @@ import (
 
     "sigs.k8s.io/controller-runtime/pkg/client"
     "sigs.k8s.io/controller-runtime/pkg/log"
+    "sigs.k8s.io/controller-runtime/pkg/handler"
+    "sigs.k8s.io/controller-runtime/pkg/predicate"
+    "sigs.k8s.io/controller-runtime/pkg/reconcile"
+    "sigs.k8s.io/controller-runtime/pkg/builder"
     corev1 "k8s.io/api/core/v1"
     appsv1 "k8s.io/api/apps/v1"
     metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -65,22 +68,26 @@ type ClusterInfo struct {
 }
 
 type NodeInfo struct {
-    NodeName          string   `json:"nodeName"`
-    Status            string   `json:"nodeStatus"`
-    CpuCapacity       string   `json:"cpuCapacity"`
-    MemoryCapacity    string   `json:"memoryCapacity"`
-    CpuAllocatable    string   `json:"cpuAllocatable"`
-    MemoryAllocatable string   `json:"memoryAllocatable"`
+    // NodeStatus        corev1.NodeStatus `json:"nodeCompleteStatus"`
+    NodeName          string        `json:"nodeName"`
+    Status            string        `json:"nodeStatus"`
+    CpuCapacity       string        `json:"cpuCapacity"`
+    MemoryCapacity    string        `json:"memoryCapacity"`
+    IoCapacity        string        `json:"ioCapacity"`
+    CpuUsage          string        `json:"cpuUsage"`
+    MemoryUsage       string        `json:"memoryUsage"`
+    IoUsage           string        `json:"ioUsage"`
     RunningPods       []FilteredPod `json:"runningPods"`
 }
 
+
 type FilteredPod struct {
-    Name         string            `json:"name"`
-    Namespace    string            `json:"namespace"`
-    Labels       map[string]string `json:"labels"`
-    ServingService string          `json:"servingService"`
-    ServingRevision string         `json:"servingRevision"`
-    Container    ContainerInfo     `json:"container"`
+    Name             string            `json:"name"`
+    Namespace        string            `json:"namespace"`
+    CpuRequests      string            `json:"cpuRequests"`
+    MemoryRequests   string            `json:"memoryRequests"`
+    IoRequests       string            `json:"ioRequests"`
+    Containers       []ContainerInfo   `json:"containers"`
 }
 
 type ContainerInfo struct {
@@ -102,16 +109,38 @@ func (r *CustomSchedulerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
     logger := log.FromContext(ctx)
     logger.Info("Reconcile function called", "name", req.Name, "namespace", req.Namespace)
 
-    // Fetch the CustomScheduler instance
-    var customScheduler servingv1alpha1.CustomScheduler
-    if err := r.Get(ctx, req.NamespacedName, &customScheduler); err != nil {
-        logger.Error(err, "Failed to get CustomScheduler")
+    logger.Info("Trying to get pod: ", "name", req.Name, "namespace", req.Namespace)
+    // Get the pod that triggered the reconcile
+    var pod corev1.Pod
+    if err := r.Get(ctx, req.NamespacedName, &pod); err != nil {
+        logger.Info("Failed to get Pod, Probably not workload pod")
         return ctrl.Result{}, client.IgnoreNotFound(err)
     }
 
-    logger.Info("Reconciling CustomScheduler", "schedulerName", customScheduler.Spec.SchedulerName)
-    
-    // Load configuration from ConfigMap
+    // List all CustomScheduler instances
+    var customSchedulers servingv1alpha1.CustomSchedulerList
+    if err := r.List(ctx, &customSchedulers, &client.ListOptions{Namespace: "default"}); err != nil {
+        logger.Error(err, "Failed to list CustomSchedulers")
+        return ctrl.Result{}, err
+    }
+
+    if len(customSchedulers.Items) == 0 {
+        logger.Error(fmt.Errorf("no CustomScheduler found"), "No CustomScheduler instances found")
+        return ctrl.Result{}, nil
+    }
+
+    // Assuming there's only one CustomScheduler instance
+    customScheduler := customSchedulers.Items[0]
+    logger.Info("Reconciling CustomScheduler", "Name", customScheduler.Name, "schedulerName", customScheduler.Spec.SchedulerName)
+
+    // Get cluster information
+    clusterInfo, err := r.getClusterInfo(ctx)
+    if err != nil {
+        logger.Error(err, "Failed to get cluster information")
+        return ctrl.Result{}, err
+    }
+
+    // Load custom metrics from ConfigMap
     var configMap corev1.ConfigMap
     if err := r.Get(ctx, types.NamespacedName{Name: "scheduler-config", Namespace: "default"}, &configMap); err != nil {
         logger.Error(err, "Failed to get scheduler-config ConfigMap")
@@ -168,13 +197,6 @@ func (r *CustomSchedulerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
         logger.Info("Found pods", "count", len(pods.Items))
     }
 
-    // Get cluster information
-    clusterInfo, err := r.getClusterInfo(ctx)
-    if err != nil {
-        logger.Error(err, "Failed to get cluster information")
-        return ctrl.Result{}, err
-    }
-
     prometheusURL := "http://prometheus-kube-prometheus-prometheus.default.svc.cluster.local:9090"
     metrics := make(map[string]interface{})
     prometheusError := ""
@@ -192,53 +214,41 @@ func (r *CustomSchedulerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
     }
 
     // Bind each unassigned Pod to a node specified by the external scheduler
-    for _, pod := range pods.Items {
-        if pod.Spec.NodeName == "" { // Check if the pod is not assigned to any node
-            filteredPod := FilteredPod{
-                Name:         pod.Name,
-                Namespace:    pod.Namespace,
-                Labels:       pod.Labels,
-                ServingService: pod.Labels["serving.knative.dev/service"],
-                ServingRevision: pod.Labels["serving.knative.dev/revision"],
-                Container: ContainerInfo{
-                    Name:  pod.Spec.Containers[0].Name, // Assuming the first container is the user-container
-                    Image: pod.Spec.Containers[0].Image, // Assuming the first container is the user-container
-                },
-            }
+    if pod.Spec.NodeName == "" { // Check if the pod is not assigned to any node
+        filteredPod := r.createFilteredPod(pod)
 
-            request := SchedulerRequest{
-                Parameters:      parameters,
-                Pod:             filteredPod,
-                ClusterInfo:     clusterInfo,
-                Metrics:         metrics,
-                PrometheusError: prometheusError,
-            }
+        request := SchedulerRequest{
+            Parameters:      parameters,
+            Pod:             filteredPod,
+            ClusterInfo:     clusterInfo,
+            Metrics:         metrics,
+            PrometheusError: prometheusError,
+        }
 
-            nodeName, err := r.getNodeFromScheduler(request, schedulerURL)
-            if err != nil {
-                logger.Error(err, "Failed to get node from scheduler")
-                return ctrl.Result{}, err
-            }
+        nodeName, err := r.getNodeFromScheduler(request, schedulerURL)
+        if err != nil {
+            logger.Error(err, "Failed to get node from scheduler")
+            return ctrl.Result{}, err
+        }
 
-            logger.Info("Binding pod", "podName", pod.Name, "nodeName", nodeName)
-            binding := &corev1.Binding{
-                ObjectMeta: metav1.ObjectMeta{
-                    Name:      pod.Name,
-                    Namespace: pod.Namespace,
-                },
-                Target: corev1.ObjectReference{
-                    Kind: "Node",
-                    Name: nodeName,
-                },
-            }
-            if err := r.Client.Create(ctx, binding); err != nil {
-                logger.Error(err, "Failed to bind pod", "podName", pod.Name)
-                return ctrl.Result{}, err
-            }
+        logger.Info("Binding pod", "podName", pod.Name, "nodeName", nodeName)
+        binding := &corev1.Binding{
+            ObjectMeta: metav1.ObjectMeta{
+                Name:      pod.Name,
+                Namespace: pod.Namespace,
+            },
+            Target: corev1.ObjectReference{
+                Kind: "Node",
+                Name: nodeName,
+            },
+        }
+        if err := r.Client.Create(ctx, binding); err != nil {
+            logger.Error(err, "Failed to bind pod", "podName", pod.Name)
+            return ctrl.Result{}, err
         }
     }
 
-    return ctrl.Result{RequeueAfter: time.Second * 5}, nil
+    return ctrl.Result{}, nil
 }
 
 func isPrometheusAvailable(prometheusURL string) bool {
@@ -268,26 +278,62 @@ func (r *CustomSchedulerReconciler) getCustomMetrics(prometheusURL string, queri
     return metrics, nil
 }
 
+func (r *CustomSchedulerReconciler) createFilteredPod(pod corev1.Pod) FilteredPod {
+    var totalCpuRequests, totalMemoryRequests, totalIoRequests int64
+    var containers []ContainerInfo
+
+    for _, container := range pod.Spec.Containers {
+        totalCpuRequests += container.Resources.Requests.Cpu().MilliValue()
+        totalMemoryRequests += container.Resources.Requests.Memory().Value()
+        totalIoRequests += container.Resources.Requests.StorageEphemeral().Value()
+
+        containers = append(containers, ContainerInfo{
+            Name:  container.Name,
+            Image: container.Image,
+        })
+    }
+
+    return FilteredPod{
+        Name:            pod.Name,
+        Namespace:       pod.Namespace,
+        CpuRequests:     fmt.Sprintf("%dm", totalCpuRequests),
+        MemoryRequests:  fmt.Sprintf("%dMi", totalMemoryRequests/(1024*1024)),
+        IoRequests:      fmt.Sprintf("%d", totalIoRequests),
+        Containers:      containers,
+    }
+}
+
 func (r *CustomSchedulerReconciler) getNodeInfo(ctx context.Context) ([]NodeInfo, error) {
     var nodes corev1.NodeList
     if err := r.List(ctx, &nodes); err != nil {
         return nil, err
     }
 
+
     var nodeInfos []NodeInfo
     for _, node := range nodes.Items {
-        // Filter out nodes that have the control-plane role
         if _, ok := node.Labels["node-role.kubernetes.io/control-plane"]; ok {
             continue
         }
 
+        cpuCapacity := node.Status.Capacity.Cpu().String()
+        memoryCapacity := node.Status.Capacity.Memory().String()
+        ioCapacity := node.Status.Capacity.StorageEphemeral().String()
+
+        cpuUsage := node.Status.Allocatable.Cpu().String()
+        memoryUsage := node.Status.Allocatable.Memory().String()
+        ioUsage := node.Status.Allocatable.StorageEphemeral().String()
+
         nodeInfo := NodeInfo{
+            // NodeStatus:        node.Status,
             NodeName:          node.Name,
             Status:            getNodeStatus(&node),
-            CpuCapacity:       node.Status.Capacity.Cpu().String(),
-            MemoryCapacity:    node.Status.Capacity.Memory().String(),
-            CpuAllocatable:    node.Status.Allocatable.Cpu().String(),
-            MemoryAllocatable: node.Status.Allocatable.Memory().String(),
+            CpuCapacity:       cpuCapacity,
+            MemoryCapacity:    memoryCapacity,
+            IoCapacity:        ioCapacity,
+            CpuUsage:          cpuUsage,
+            MemoryUsage:       memoryUsage,
+            IoUsage:           ioUsage,
             RunningPods:       []FilteredPod{},
         }
         nodeInfos = append(nodeInfos, nodeInfo)
@@ -315,17 +361,7 @@ func (r *CustomSchedulerReconciler) getPodInfo(ctx context.Context) (map[string]
 
     filteredPodMap := make(map[string][]FilteredPod)
     for _, pod := range pods.Items {
-        filteredPod := FilteredPod{
-            Name:       pod.Name,
-            Namespace:  pod.Namespace,
-            Labels:     pod.Labels,
-            ServingService: pod.Labels["serving.knative.dev/service"],
-            ServingRevision: pod.Labels["serving.knative.dev/revision"],
-            Container: ContainerInfo{
-                Name:  pod.Spec.Containers[0].Name, // Assuming the first container is the user-container
-                Image: pod.Spec.Containers[0].Image, // Assuming the first container is the user-container
-            },
-        }
+        filteredPod := r.createFilteredPod(pod)
         filteredPodMap[pod.Spec.NodeName] = append(filteredPodMap[pod.Spec.NodeName], filteredPod)
     }
     return filteredPodMap, nil
@@ -354,6 +390,7 @@ func (r *CustomSchedulerReconciler) getClusterInfo(ctx context.Context) (Cluster
 func (r *CustomSchedulerReconciler) getNodeFromScheduler(request SchedulerRequest, schedulerURL string) (string, error) {
     client := &http.Client{}
     reqBody, err := json.Marshal(request)
+
     if err != nil {
         return "", err
     }
@@ -383,7 +420,7 @@ func (r *CustomSchedulerReconciler) getNodeFromScheduler(request SchedulerReques
     return schedulerResponse.Node, nil
 }
 
-// SetupWithManager sets up the controller with the Manager.
+// // SetupWithManager sets up the controller with the Manager.
 func (r *CustomSchedulerReconciler) SetupWithManager(mgr ctrl.Manager) error {
     if err := mgr.GetFieldIndexer().IndexField(context.Background(), &corev1.Pod{}, "spec.schedulerName", func(rawObj client.Object) []string {
         pod := rawObj.(*corev1.Pod)
@@ -391,7 +428,26 @@ func (r *CustomSchedulerReconciler) SetupWithManager(mgr ctrl.Manager) error {
     }); err != nil {
         return err
     }
+
     return ctrl.NewControllerManagedBy(mgr).
         For(&servingv1alpha1.CustomScheduler{}).
+        Watches(
+            &corev1.Pod{},
+            handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, a client.Object) []reconcile.Request {
+                pod := a.(*corev1.Pod)
+                return []reconcile.Request{
+                    {NamespacedName: types.NamespacedName{
+                        Name:      pod.Name,
+                        Namespace: pod.Namespace,
+                    }},
+                }
+            }),
+            builder.WithPredicates(
+                predicate.NewPredicateFuncs(func(obj client.Object) bool {
+                    pod := obj.(*corev1.Pod)
+                    return pod.Spec.SchedulerName == "custom-scheduler"
+                }),
+            ),
+        ).
         Complete(r)
 }
