@@ -24,7 +24,8 @@ import (
     "bytes"
     "net/url"
     "strings"
-    
+    "time"
+
     "sigs.k8s.io/controller-runtime/pkg/client"
     "sigs.k8s.io/controller-runtime/pkg/log"
     "sigs.k8s.io/controller-runtime/pkg/handler"
@@ -107,6 +108,7 @@ type ContainerInfo struct {
 //+kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
 //+kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
 //+kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch
+//+kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 
 func (r *CustomSchedulerReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -257,9 +259,39 @@ func (r *CustomSchedulerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
             logger.Error(err, "Failed to bind pod", "podName", pod.Name)
             return ctrl.Result{}, err
         }
+
+        r.createScheduledEvent(ctx, &pod, nodeName)
     }
 
     return ctrl.Result{}, nil
+}
+
+func (r *CustomSchedulerReconciler) createScheduledEvent(ctx context.Context, pod *corev1.Pod, nodeName string) {
+    event := &corev1.Event{
+        ObjectMeta: metav1.ObjectMeta{
+            Name:      fmt.Sprintf("%s.%x", pod.Name, time.Now().UnixNano()),
+            Namespace: pod.Namespace,
+        },
+        InvolvedObject: corev1.ObjectReference{
+            Kind:      "Pod",
+            Namespace: pod.Namespace,
+            Name:      pod.Name,
+            UID:       pod.UID,
+        },
+        Reason:  "Scheduled",
+        Message: fmt.Sprintf("Successfully assigned %s/%s to %s", pod.Namespace, pod.Name, nodeName),
+        Source: corev1.EventSource{
+            Component: "custom-scheduler",
+        },
+        FirstTimestamp: metav1.Now(),
+        LastTimestamp:  metav1.Now(),
+        Count:          1,
+        Type:           corev1.EventTypeNormal,
+    }
+
+    if err := r.Client.Create(ctx, event); err != nil {
+        log.FromContext(ctx).Error(err, "Failed to create scheduled event")
+    }
 }
 
 func isPrometheusAvailable(prometheusURL string) bool {
