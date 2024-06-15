@@ -483,7 +483,7 @@ func (r *CustomSchedulerReconciler) getNodeFromScheduler(logger logr.Logger, req
     return schedulerResponse.Node, nil
 }
 
-// // SetupWithManager sets up the controller with the Manager.
+// SetupWithManager sets up the controller with the Manager.
 func (r *CustomSchedulerReconciler) SetupWithManager(mgr ctrl.Manager) error {
     if err := mgr.GetFieldIndexer().IndexField(context.Background(), &corev1.Pod{}, "spec.schedulerName", func(rawObj client.Object) []string {
         pod := rawObj.(*corev1.Pod)
@@ -498,12 +498,17 @@ func (r *CustomSchedulerReconciler) SetupWithManager(mgr ctrl.Manager) error {
             &corev1.Pod{},
             handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, a client.Object) []reconcile.Request {
                 pod := a.(*corev1.Pod)
-                return []reconcile.Request{
-                    {NamespacedName: types.NamespacedName{
-                        Name:      pod.Name,
-                        Namespace: pod.Namespace,
-                    }},
+
+                if pod.Spec.NodeName == "" && pod.Status.Phase == corev1.PodPending{
+                    return []reconcile.Request{
+                        {NamespacedName: types.NamespacedName{
+                            Name:      pod.Name,
+                            Namespace: pod.Namespace,
+                        }},
+                    }
                 }
+
+                return []reconcile.Request{}
             }),
             builder.WithPredicates(
                 predicate.NewPredicateFuncs(func(obj client.Object) bool {
