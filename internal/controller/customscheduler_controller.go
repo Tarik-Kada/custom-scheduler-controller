@@ -123,6 +123,11 @@ func (r *CustomSchedulerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
         return ctrl.Result{}, client.IgnoreNotFound(err)
     }
 
+    if pod.Spec.NodeName != "" { // Check if the pod is not assigned to any node
+        logger.Info("Pod is already assigned to a node", "nodeName", pod.Spec.NodeName)
+        return ctrl.Result{}, nil
+    }
+
     // List all CustomScheduler instances
     var customSchedulers servingv1alpha1.CustomSchedulerList
     if err := r.List(ctx, &customSchedulers, &client.ListOptions{Namespace: "default"}); err != nil {
@@ -226,42 +231,40 @@ func (r *CustomSchedulerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
     }
 
-    // Bind each unassigned Pod to a node specified by the external scheduler
-    if pod.Spec.NodeName == "" { // Check if the pod is not assigned to any node
-        filteredPod := createFilteredPod(&pod)
+    // Bind unassigned Pod to a node specified by the external scheduler
+    filteredPod := createFilteredPod(&pod)
 
-        request := SchedulerRequest{
-            Parameters:      parameters,
-            Pod:             filteredPod,
-            ClusterInfo:     clusterInfo,
-            Metrics:         metrics,
-            PrometheusError: prometheusError,
-        }
-
-        nodeName, err := r.getNodeFromScheduler(logger, request, schedulerURL)
-        if err != nil {
-            logger.Error(err, "Failed to get node from scheduler")
-            return ctrl.Result{}, err
-        }
-
-        logger.Info("Binding pod", "podName", pod.Name, "nodeName", nodeName)
-        binding := &corev1.Binding{
-            ObjectMeta: metav1.ObjectMeta{
-                Name:      pod.Name,
-                Namespace: pod.Namespace,
-            },
-            Target: corev1.ObjectReference{
-                Kind: "Node",
-                Name: nodeName,
-            },
-        }
-        if err := r.Client.Create(ctx, binding); err != nil {
-            logger.Error(err, "Failed to bind pod", "podName", pod.Name)
-            return ctrl.Result{}, err
-        }
-
-        r.createScheduledEvent(ctx, &pod, nodeName)
+    request := SchedulerRequest{
+        Parameters:      parameters,
+        Pod:             filteredPod,
+        ClusterInfo:     clusterInfo,
+        Metrics:         metrics,
+        PrometheusError: prometheusError,
     }
+
+    nodeName, err := r.getNodeFromScheduler(logger, request, schedulerURL)
+    if err != nil {
+        logger.Error(err, "Failed to get node from scheduler")
+        return ctrl.Result{}, err
+    }
+
+    logger.Info("Binding pod", "podName", pod.Name, "nodeName", nodeName)
+    binding := &corev1.Binding{
+        ObjectMeta: metav1.ObjectMeta{
+            Name:      pod.Name,
+            Namespace: pod.Namespace,
+        },
+        Target: corev1.ObjectReference{
+            Kind: "Node",
+            Name: nodeName,
+        },
+    }
+    if err := r.Client.Create(ctx, binding); err != nil {
+        logger.Error(err, "Failed to bind pod", "podName", pod.Name)
+        return ctrl.Result{}, err
+    }
+
+    r.createScheduledEvent(ctx, &pod, nodeName)
 
     return ctrl.Result{}, nil
 }
