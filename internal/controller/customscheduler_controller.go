@@ -205,16 +205,6 @@ func (r *CustomSchedulerReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 
     logger.Info("Scheduler URL", "url", schedulerURL)
 
-    // Fetch all Pods with the specified schedulerName
-    var pods corev1.PodList
-    if err := r.List(ctx, &pods, client.MatchingFields{"spec.schedulerName": customScheduler.Spec.SchedulerName}); err != nil {
-        return ctrl.Result{}, err
-    }
-
-    if len(pods.Items) != 0 {
-        logger.Info("Found pods", "count", len(pods.Items))
-    }
-
     prometheusURL := "http://prometheus-kube-prometheus-prometheus.default.svc.cluster.local:9090"
     metrics := make(map[string]interface{})
     prometheusError := ""
